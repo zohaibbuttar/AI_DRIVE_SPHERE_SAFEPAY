@@ -7,7 +7,6 @@ export async function POST(request: NextRequest) {
   const signature = request.headers.get("x-sfpy-signature") || ""
   const webhookSecret = process.env.SAFEPAY_WEBHOOK_SECRET
 
-  // Verify webhook HMAC-SHA256 signature
   if (webhookSecret) {
     const expected = crypto
       .createHmac("sha256", webhookSecret)
@@ -28,7 +27,6 @@ export async function POST(request: NextRequest) {
   const supabase = await createClient()
   const eventType = event?.type || event?.notification_type
 
-  // ── Handle successful payment ──
   if (
     eventType === "payment:created" ||
     eventType === "payment:success" ||
@@ -36,13 +34,12 @@ export async function POST(request: NextRequest) {
   ) {
     const trackerToken = event?.payload?.tracker?.token || event?.token
     const referenceNumber = event?.payload?.reference_number || event?.reference || trackerToken
+    const orderId = event?.payload?.order_id || event?.order_id
 
     if (!trackerToken) {
       return NextResponse.json({ error: "No tracker token" }, { status: 400 })
     }
 
-    // Find booking — first by order_id (bookingId), then by tracker token
-    const orderId = event?.payload?.order_id || event?.order_id
     let booking = null
 
     if (orderId) {
@@ -54,47 +51,46 @@ export async function POST(request: NextRequest) {
       booking = data
     }
 
-    if (!booking) {
+    if (!booking && trackerToken) {
       const { data } = await supabase
         .from("bookings")
         .select("id, user_id, total_price")
         .eq("safepay_tracker_token", trackerToken)
-        .single()
+        .maybeSingle()
       booking = data
     }
 
     if (booking) {
       await supabase
         .from("bookings")
-        .update({
-          payment_status: "paid",
-          status: "confirmed",
-          safepay_reference_number: referenceNumber,
-        })
+        .update({ payment_status: "paid", status: "confirmed" })
         .eq("id", booking.id)
 
-      await supabase
-        .from("payments")
-        .upsert(
-          {
-            booking_id: booking.id,
-            user_id: booking.user_id,
-            safepay_tracker_token: trackerToken,
-            safepay_reference_number: referenceNumber,
-            amount: booking.total_price,
-            currency: "pkr",
-            status: "succeeded",
-          },
-          { onConflict: "safepay_tracker_token" }
-        )
+      await supabase.from("payments").upsert(
+        {
+          booking_id: booking.id,
+          user_id: booking.user_id,
+          safepay_tracker_token: trackerToken,
+          safepay_reference_number: referenceNumber,
+          amount: booking.total_price,
+          currency: "pkr",
+          status: "succeeded",
+        },
+        { onConflict: "safepay_tracker_token" }
+      )
     }
-    // Return 200 even if booking not found — prevents Safepay retry loops
   }
 
-  // ── Handle failed payment ──
   if (eventType === "payment:failed" || event?.payload?.state === "FAILED") {
     const trackerToken = event?.payload?.tracker?.token || event?.token
-    if (trackerToken) {
+    const orderId = event?.payload?.order_id || event?.order_id
+
+    if (orderId) {
+      await supabase
+        .from("bookings")
+        .update({ payment_status: "unpaid", status: "pending" })
+        .eq("id", orderId)
+    } else if (trackerToken) {
       await supabase
         .from("bookings")
         .update({ payment_status: "unpaid", status: "pending" })
@@ -105,7 +101,6 @@ export async function POST(request: NextRequest) {
   return NextResponse.json({ received: true })
 }
 
-// GET for webhook verification ping
 export async function GET() {
   return NextResponse.json({ status: "Webhook endpoint active" })
 }

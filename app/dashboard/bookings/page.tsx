@@ -1,69 +1,154 @@
-"use client"
+import { createClient } from "@/lib/supabase/server"
+import { Card, CardContent } from "@/components/ui/card"
+import { Badge } from "@/components/ui/badge"
+import { CalendarDays, CheckCircle2 } from "lucide-react"
+import Link from "next/link"
+import { CancelBookingButton } from "@/components/dashboard/cancel-booking-button"
+import { PayBookingButton } from "@/components/dashboard/pay-booking-button"
 
-import { useState } from "react"
-import { useRouter } from "next/navigation"
-
-interface PayBookingButtonProps {
-  bookingId: string
-  vehicleName: string
-  totalPrice: number
+const statusColors: Record<string, "default" | "secondary" | "destructive" | "outline"> = {
+  pending: "outline",
+  confirmed: "secondary",
+  active: "default",
+  completed: "secondary",
+  cancelled: "destructive",
 }
 
-export function PayBookingButton({ bookingId, vehicleName, totalPrice }: PayBookingButtonProps) {
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const router = useRouter()
+const paymentColors: Record<string, string> = {
+  unpaid: "text-amber-500",
+  paid: "text-green-400",
+  refunded: "text-blue-400",
+}
 
-  const handlePayment = async () => {
-    setLoading(true)
-    setError(null)
+export default async function BookingsPage() {
+  const supabase = await createClient()
+  const { data: { user } } = await supabase.auth.getUser()
 
-    try {
-      const res = await fetch("/api/payment", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ vehicleName, totalPrice, bookingId }),
-      })
-
-      const data = await res.json()
-
-      if (!res.ok) {
-        throw new Error(data.error || "Payment initiation failed")
-      }
-
-      // SafePay returns a tracker token — redirect to SafePay checkout
-      const trackerToken =
-        data?.data?.tracker?.token ||
-        data?.tracker?.token ||
-        data?.token
-
-      if (!trackerToken) {
-        console.error("SafePay response:", data)
-        throw new Error("No tracker token received from SafePay")
-      }
-
-      // Redirect to SafePay sandbox checkout
-      const checkoutUrl = `https://sandbox.api.getsafepay.com/checkout/pay?tracker=${trackerToken}&source=custom`
-      window.location.href = checkoutUrl
-
-    } catch (err: any) {
-      console.error("Payment error:", err)
-      setError(err.message || "Something went wrong")
-      setLoading(false)
-    }
-  }
+  const { data: bookings } = await supabase
+    .from("bookings")
+    .select("*, vehicles(name, type, plate_number, image_url)")
+    .eq("user_id", user!.id)
+    .order("created_at", { ascending: false })
 
   return (
-    <div className="flex flex-col items-end gap-1">
-      <button
-        onClick={handlePayment}
-        disabled={loading}
-        className="rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white hover:bg-amber-600 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
-      >
-        {loading ? "Processing..." : "Pay Now"}
-      </button>
-      {error && (
-        <p className="text-xs text-red-400 max-w-[180px] text-right">{error}</p>
+    <div className="flex flex-col gap-8">
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="font-serif text-2xl font-bold text-foreground">My Bookings</h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            View and manage all your vehicle rentals
+          </p>
+        </div>
+        <Link
+          href="/dashboard/vehicles"
+          className="rounded-lg bg-primary px-5 py-2.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors"
+        >
+          New Booking
+        </Link>
+      </div>
+
+      {!bookings || bookings.length === 0 ? (
+        <Card>
+          <CardContent className="flex flex-col items-center justify-center py-16">
+            <CalendarDays className="mb-4 h-12 w-12 text-muted-foreground/30" />
+            <p className="text-sm text-muted-foreground">
+              No bookings yet.{" "}
+              <Link href="/dashboard/vehicles" className="text-accent hover:underline">
+                Browse vehicles
+              </Link>{" "}
+              to make your first booking.
+            </p>
+          </CardContent>
+        </Card>
+      ) : (
+        <div className="flex flex-col gap-4">
+          {bookings.map((booking: any) => {
+            const needsPayment =
+              booking.status === "pending" &&
+              (!booking.payment_status || booking.payment_status === "unpaid")
+            const isPaid = booking.payment_status === "paid"
+
+            // Calculate days
+            const start = new Date(booking.start_date)
+            const end = new Date(booking.end_date)
+            const days = Math.round((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24))
+
+            const startFormatted = start.toLocaleDateString("en-PK", {
+              weekday: "short", year: "numeric", month: "short", day: "numeric",
+            })
+            const endFormatted = end.toLocaleDateString("en-PK", {
+              weekday: "short", year: "numeric", month: "short", day: "numeric",
+            })
+
+            return (
+              <Card
+                key={booking.id}
+                className={needsPayment ? "border-amber-500/30" : ""}
+              >
+                <CardContent className="flex flex-col gap-4 p-6 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="flex flex-col gap-1">
+                    <div className="flex items-center gap-3 flex-wrap">
+                      <h3 className="font-serif text-lg font-bold text-card-foreground">
+                        {booking.vehicles?.name || "Vehicle"}
+                      </h3>
+                      <Badge variant={statusColors[booking.status] || "outline"}>
+                        {booking.status}
+                      </Badge>
+                      {isPaid && (
+                        <span className="flex items-center gap-1 text-xs text-green-400 font-medium">
+                          <CheckCircle2 className="h-3.5 w-3.5" /> Paid
+                        </span>
+                      )}
+                      {needsPayment && (
+                        <span className="text-xs text-amber-500 font-medium animate-pulse">
+                          ⚠️ Payment Required
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      {booking.vehicles?.plate_number} · {booking.vehicles?.type}
+                    </p>
+                    <p className="text-sm text-muted-foreground">
+                      {startFormatted} → {endFormatted}
+                    </p>
+                    {booking.notes && (
+                      <p className="mt-1 text-xs text-muted-foreground italic">
+                        {booking.notes}
+                      </p>
+                    )}
+                  </div>
+
+                  <div className="flex items-center gap-4 flex-wrap">
+                    <div className="text-right">
+                      <p className="text-xl font-bold text-card-foreground">
+                        PKR {Number(booking.total_price).toLocaleString()}
+                      </p>
+                      <p className={`text-xs font-medium ${paymentColors[booking.payment_status] || "text-muted-foreground"}`}>
+                        {booking.payment_status || "unpaid"}
+                      </p>
+                    </div>
+
+                    <div className="flex gap-2">
+                      {needsPayment && (
+                        <PayBookingButton
+                          bookingId={booking.id}
+                          vehicleName={booking.vehicles?.name || "Vehicle"}
+                          totalPrice={Number(booking.total_price)}
+                          startDate={startFormatted}
+                          endDate={endFormatted}
+                          days={days}
+                        />
+                      )}
+                      {(booking.status === "pending" || booking.status === "confirmed") && (
+                        <CancelBookingButton bookingId={booking.id} />
+                      )}
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+            )
+          })}
+        </div>
       )}
     </div>
   )

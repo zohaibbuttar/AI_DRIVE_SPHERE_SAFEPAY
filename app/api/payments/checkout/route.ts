@@ -9,101 +9,105 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
   }
 
-  const { bookingId, vehicleName, totalPrice } = await request.json()
+  const { bookingId, totalPrice } = await request.json()
 
-  if (!bookingId || !vehicleName || !totalPrice) {
+  if (!bookingId || !totalPrice) {
     return NextResponse.json({ error: "Missing required fields" }, { status: 400 })
   }
 
-  const secretKey = process.env.SAFEPAY_SECRET_KEY
-  const publicKey = process.env.SAFEPAY_PUBLIC_KEY
-
-  if (!secretKey || !publicKey) {
-    return NextResponse.json({ error: "Payment gateway not configured" }, { status: 503 })
-  }
-
+  const secretKey = process.env.SAFEPAY_SECRET_KEY!
+  const publicKey = process.env.SAFEPAY_PUBLIC_KEY!
   const appUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000"
+  const BASE = "https://sandbox.api.getsafepay.com"
 
   try {
-    // ── Step 1: Create a tracker (payment session) with Safepay ──
-    const sessionRes = await fetch("https://sandbox.api.getsafepay.com/order/v1/init/", {
+    // STEP 1: Create tracker (v1 — confirmed working for this account)
+    const sessionRes = await fetch(`${BASE}/order/v1/init`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${secretKey}`,
+        "X-SFPY-MERCHANT-SECRET": secretKey,
       },
       body: JSON.stringify({
-        client: publicKey,            // ✅ correct field (not merchant_api_key)
-        intent: "CYBERSOURCE",
-        mode: "payment",
+        client: publicKey,
+        amount: Number(totalPrice),
         currency: "PKR",
-        amount: Math.round(totalPrice * 100),  // in paisa
-        order_id: bookingId,
+        environment: "sandbox",
       }),
     })
 
-    // Read raw text first — Safepay sometimes returns HTML on auth errors
-    const rawText = await sessionRes.text()
-    console.log("Safepay raw response status:", sessionRes.status)
-    console.log("Safepay raw response:", rawText.slice(0, 500))
-
-    if (rawText.trim().startsWith("<")) {
-      console.error("Safepay returned HTML (auth error):", rawText.slice(0, 300))
-      return NextResponse.json(
-        { error: "Safepay authentication failed. Check your API keys." },
-        { status: 502 }
-      )
-    }
+    const sessionText = await sessionRes.text()
+    console.log("[safepay] tracker status:", sessionRes.status)
+    console.log("[safepay] tracker body:", sessionText.slice(0, 400))
 
     let sessionData: any
-    try {
-      sessionData = JSON.parse(rawText)
-    } catch {
-      return NextResponse.json({ error: "Invalid JSON from Safepay" }, { status: 502 })
+    try { sessionData = JSON.parse(sessionText) } catch {
+      return NextResponse.json({ error: `Safepay non-JSON: ${sessionText.slice(0, 200)}` }, { status: 502 })
     }
 
     if (!sessionRes.ok) {
-      console.error("Safepay error response:", sessionData)
-      return NextResponse.json(
-        { error: sessionData?.message || sessionData?.error || "Safepay session creation failed" },
-        { status: 502 }
-      )
+      return NextResponse.json({ error: sessionData?.status?.errors?.[0] || "Tracker creation failed" }, { status: 502 })
     }
 
-    // Extract tracker token — try multiple possible paths
-    const trackerToken =
-      sessionData?.data?.tracker?.token ||
-      sessionData?.tracker?.token ||
-      sessionData?.token
-
+    const trackerToken = sessionData?.data?.token
     if (!trackerToken) {
-      console.error("No tracker token in Safepay response:", sessionData)
-      return NextResponse.json(
-        { error: "No tracker token returned from Safepay" },
-        { status: 502 }
-      )
+      return NextResponse.json({ error: "No tracker token returned" }, { status: 502 })
+    }
+    console.log("[safepay] ✅ tracker:", trackerToken)
+
+    // STEP 2: Get auth token (tbt)
+    const authRes = await fetch(`${BASE}/client/passport/v1/token`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-SFPY-MERCHANT-SECRET": secretKey,
+      },
+      body: JSON.stringify({}),
+    })
+
+    const authText = await authRes.text()
+    console.log("[safepay] auth status:", authRes.status)
+
+    let authData: any
+    try { authData = JSON.parse(authText) } catch {
+      return NextResponse.json({ error: `Auth token non-JSON: ${authText.slice(0, 200)}` }, { status: 502 })
     }
 
-    // ── Step 2: Build the Safepay hosted checkout URL ──
-    const checkoutUrl =
-      `https://sandbox.api.getsafepay.com/components?` +
-      `beacon=${encodeURIComponent(trackerToken)}` +
-      `&redirect_url=${encodeURIComponent(`${appUrl}/dashboard/bookings?success=true`)}` +
-      `&cancel_url=${encodeURIComponent(`${appUrl}/dashboard/bookings?cancelled=true`)}` +
-      `&order_id=${encodeURIComponent(bookingId)}`
+    if (!authRes.ok) {
+      return NextResponse.json({ error: authData?.status?.errors?.[0] || "Auth token failed" }, { status: 502 })
+    }
 
-    // ── Step 3: Save tracker token to booking ──
-    await supabase
-      .from("bookings")
-      .update({
-        safepay_tracker_token: trackerToken,
-        payment_status: "unpaid",
-      })
-      .eq("id", bookingId)
+    const tbt = authData?.data
+    if (!tbt || typeof tbt !== "string") {
+      return NextResponse.json({ error: "No tbt token returned" }, { status: 502 })
+    }
+    console.log("[safepay] ✅ tbt received")
+
+    // STEP 3: Build checkout URL
+    const params = new URLSearchParams({
+      env: "sandbox",
+      beacon: trackerToken,
+      tbt: tbt,
+      source: "hosted",
+      redirect_url: `${appUrl}/dashboard/bookings?success=true`,
+      cancel_url: `${appUrl}/dashboard/bookings?cancelled=true`,
+    })
+
+    const checkoutUrl = `${BASE}/checkout?${params.toString()}`
+    console.log("[safepay] ✅ checkout URL ready")
+
+    // Save tracker to booking (non-fatal)
+    try {
+      await supabase
+        .from("bookings")
+        .update({ safepay_tracker_token: trackerToken, payment_status: "unpaid" })
+        .eq("id", bookingId)
+    } catch (_) {}
 
     return NextResponse.json({ url: checkoutUrl, tracker_token: trackerToken })
+
   } catch (err: any) {
-    console.error("Payment error:", err)
-    return NextResponse.json({ error: err.message || "Payment failed" }, { status: 500 })
+    console.error("[safepay] error:", err)
+    return NextResponse.json({ error: err.message }, { status: 500 })
   }
 }
